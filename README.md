@@ -59,25 +59,28 @@ TIMEZONE=Asia/Kolkata
 pip install -r requirements.txt
 ```
 
-### 3. Run the Bot
-```bash
-python bot.py
-```
+### 3. Run the Bot Locally
+You can run the bot in any of these ways:
+
+* **Option A (Visible Console):** Double-click [`start_bot.bat`](file:///c:/Users/user/.gemini/antigravity/scratch/tech-spotter-bot/start_bot.bat)
+* **Option B (Silent Background):** Double-click [`start_silent.vbs`](file:///c:/Users/user/.gemini/antigravity/scratch/tech-spotter-bot/start_silent.vbs) *(runs completely hidden without a terminal window)*
+* **Option C (To Stop Silent Bot):** Double-click [`stop_bot.bat`](file:///c:/Users/user/.gemini/antigravity/scratch/tech-spotter-bot/stop_bot.bat)
+* **Option D (Command line):**
+  ```powershell
+  python bot.py
+  ```
 
 ### 4. Run the Test Suite
-```bash
+```powershell
 pytest test_spotter.py -v
 ```
 
 ---
 
-## 📦 Deployment Options (100% Free)
-
-1. **Local PM2 Daemon (Recommended for Laptop users):**
-   ```bash
-   npm install -g pm2
-   pm2 start bot.py --name "spotter-bot" --interpreter python
-   pm2 save
-   ```
-2. **Koyeb Free Worker:** Push to GitHub and deploy as a background worker with `Procfile`.
-3. **PythonAnywhere:** Upload files and run as an Always-on task with permanent SQLite storage.
+## 📦 Background Daemon (PM2 on Laptop)
+If you want the bot to automatically restart if it closes or whenever your laptop starts:
+```powershell
+npm install -g pm2
+pm2 start bot.py --name "spotter-bot" --interpreter python
+pm2 save
+```
