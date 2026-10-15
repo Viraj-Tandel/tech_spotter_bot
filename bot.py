@@ -12,7 +12,7 @@ from typing import Dict, Any, Optional
 
 import pytz
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -703,6 +703,25 @@ def setup_scheduled_jobs(application: Application):
     logger.info("Daily sleep reminder (22:00) and Sunday digest (20:00) configured for %s", TIMEZONE_NAME)
 
 
+async def post_init(application: Application):
+    """Automatically registers bot command list with Telegram for native autocomplete."""
+    commands = [
+        BotCommand("start", "Main menu & quick actions"),
+        BotCommand("block", "Start focus block (/block 15, /block 30)"),
+        BotCommand("status", "Check today's blocks & active streak"),
+        BotCommand("history", "View last 7 days summary & topics"),
+        BotCommand("weekly", "Weekly summary & consistency score"),
+        BotCommand("freeze", "Use weekly streak freeze / rest day"),
+        BotCommand("stop", "Abort current block"),
+        BotCommand("health", "Diagnostic connection test"),
+    ]
+    try:
+        await application.bot.set_my_commands(commands)
+        logger.info("Bot commands successfully registered with Telegram.")
+    except Exception as e:
+        logger.warning("Could not set bot commands: %s", e)
+
+
 def build_application() -> Application:
     """Builds and returns the configured Telegram bot Application."""
     if not TELEGRAM_BOT_TOKEN:
@@ -713,7 +732,7 @@ def build_application() -> Application:
     # Initialize SQLite database
     database.init_db(DB_PATH)
 
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
 
     # Register command handlers
     app.add_handler(CommandHandler("start", cmd_start))
