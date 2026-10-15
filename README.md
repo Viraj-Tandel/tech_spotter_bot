@@ -6,18 +6,16 @@ A targeted Telegram bot designed to eliminate study procrastination on **Namaste
 
 ## 🚀 Key Features
 
-* **Focused Study Blocks (`/block`, `/block1`, `/block2`)**: Time-boxed countdown sessions (default 30 min) powered by `python-telegram-bot`'s asynchronous `JobQueue`.
-* **Slack Shield Protection (`/block2`)**: Automatically enforces keeping Slack, Teams, and Outlook closed during the office morning focus window (10:30 – 11:00 AM).
-* **Automated Daily Nudges**:
-  * **09:45 AM IST**: Morning check-in for Block 1 (Theory / Namaste DSA).
-  * **10:30 AM IST**: Office arrival check-in for Block 2 (Code / Slack Shield).
-  * **10:00 PM IST**: Gentle sleep reminder ensuring 7 hours of rest for 06:00 AM gym.
-* **Zero-Overhead Streak Tracking**:
-  * Completing **1 block per day** preserves and increments the streak.
-  * Same-day additional blocks count as "Bonus Reps" without artificially inflating streak days.
-  * Premature aborts (`/stop`) discard the session completely (no fake streak padding).
-  * Missed days dynamically reset `/status` to `0` and record an entry in `streak_break_log`.
-* **Health & Diagnostics (`/health` or `/ping`)**: Live test command verifying bot responsiveness, database read/write connectivity, and active timers.
+* **Interactive One-Tap Action Buttons**: Full inline keyboard on Telegram (`⏱️ 15m`, `⏱️ 30m`, `⏱️ 45m`, `⏱️ 60m`, `📊 Status`, `🧊 Rest Day`) for zero-friction mobile interaction.
+* **Focused Study Blocks (`/block`, `/block1`, `/block2`)**: Time-boxed countdown sessions (15, 30, 45, 60m) powered by `python-telegram-bot`'s asynchronous `JobQueue`.
+* **Topic Tagging**: Attach study topics (e.g. `/block 15 Trees` or `/block 30 Binary Search`) to track learning progression in *Namaste DSA*.
+* **Late-Night Session Protection & Night-Owl Grace**:
+  * Blocks started late at night (e.g. 11:45 PM) are credited to the day they started, even if the timer completes after midnight.
+  * Late-night sessions between 12:00 AM and 04:00 AM automatically attribute to yesterday if yesterday had no blocks, protecting your streak before sleeping.
+* **Weekly Rest Day / Streak Freeze (`/freeze` or `/rest`)**: 1 protected rest day per calendar week for gym recovery or corporate releases without breaking your streak.
+* **Sunday Night Weekly Recap (`/weekly`)**: Automated digest every Sunday at 08:00 PM with total deep work hours, consistency %, and topics covered.
+* **Gentle Sleep Reminder**: Daily 10:00 PM reminder ensuring 7 hours of rest for 06:00 AM gym.
+* **Zero-Overhead Streak Tracking**: Any block $\ge$ 15 minutes increments and locks in the streak.
 * **Single-User Whitelist Security**: Ignores unauthorized users silently.
 
 ---
@@ -26,14 +24,16 @@ A targeted Telegram bot designed to eliminate study procrastination on **Namaste
 
 | Command | Arguments | Description |
 | :--- | :--- | :--- |
-| `/start` | None | Welcome message, user authentication check, and usage instructions. |
-| `/block` | `[minutes]` (default: 30) | Starts a focus block. Auto-increments today's block count. |
-| `/block1` | None | Explicit shortcut for Block 1 (Theory / Morning Home Session). |
-| `/block2` | None | Explicit shortcut for Block 2 (Code / Office Desk with Slack Shield). |
+| `/start` or `/help` | None | Welcome message with interactive action buttons and usage instructions. |
+| `/block` | `[mins] [topic]` | Starts a focus block (e.g., `/block 15 Trees` or `/block 45`). |
+| `/block1` | `[topic]` | Shortcut for Block 1 (Namaste DSA Theory, default 30 mins). |
+| `/block2` | `[topic]` | Shortcut for Block 2 (Namaste DSA Hands-on Code + Slack Shield). |
 | `/stop` | None | Cancels ongoing timer prematurely (completely discarded). |
-| `/status` | None | Shows live countdown, today's blocks, dynamic streak, and best streak. |
-| `/history` | None | Shows past 7 days of completed blocks and deep work minutes. |
-| `/breaks` | None | Shows the audit log of broken streaks and lost days. |
+| `/status` | None | Live countdown, today's blocks, dynamic streak, and rest day status. |
+| `/history` | None | Past 7 days breakdown with completed blocks and topics studied. |
+| `/weekly` or `/summary` | None | Full current week's deep work summary, hours, and consistency grade. |
+| `/freeze` or `/rest` | `[reason]` | Uses your 1 weekly rest day to protect your streak. |
+| `/breaks` | None | Audit log of broken streaks and lost days. |
 | `/health` or `/ping` | None | Diagnostic command checking bot uptime and database connectivity. |
 
 ---

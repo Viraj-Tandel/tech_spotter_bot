@@ -373,3 +373,74 @@ def test_night_owl_grace_period_attributes_to_yesterday(test_db):
 
     logical = database.get_logical_date(dt=night_dt, tz_name="Asia/Kolkata", db_path=test_db)
     assert logical == yesterday_str
+
+
+def test_topic_tagging_and_history(test_db):
+    """Verifies that blocks are logged with topics and returned in history."""
+    database.record_completed_block(30, topic="Namaste DSA: Binary Search", db_path=test_db)
+    database.record_completed_block(15, topic="Namaste DSA: Trees", db_path=test_db)
+
+    history = database.get_history(days=1, db_path=test_db)
+    assert history[0]["blocks"] == 2
+    assert history[0]["total_mins"] == 45
+    assert "Binary Search" in history[0]["topics"]
+    assert "Trees" in history[0]["topics"]
+
+
+def test_streak_freeze_limits_and_preservation(test_db):
+    """
+    Verifies that a streak freeze can be used once per week,
+    protects the streak, and rejects a second freeze in the same week.
+    """
+    # First freeze succeeds
+    res1 = database.apply_streak_freeze(reason="Heavy Leg Day", db_path=test_db)
+    assert res1["ok"] is True
+    assert res1["already_used"] is False
+
+    # Second freeze in same week fails
+    res2 = database.apply_streak_freeze(reason="Tired", db_path=test_db)
+    assert res2["ok"] is False
+    assert res2["already_used"] is True
+
+    # Check status includes freeze info
+    status = database.get_status(db_path=test_db)
+    assert status["freeze_used_this_week"] is True
+
+
+def test_weekly_summary(test_db):
+    """Verifies weekly deep work calculation, active days, and topics."""
+    database.record_completed_block(60, topic="Dynamic Programming", db_path=test_db)
+    database.record_completed_block(30, topic="Graph Theory", db_path=test_db)
+
+    summary = database.get_weekly_summary(db_path=test_db)
+    assert summary["total_blocks"] == 2
+    assert summary["total_mins"] == 90
+    assert summary["total_hours"] == 1.5
+    assert "Dynamic Programming" in summary["topics"]
+    assert "Graph Theory" in summary["topics"]
+    assert summary["active_days"] >= 1
+
+
+@pytest.mark.anyio
+async def test_callback_query_handler(monkeypatch, test_db):
+    """Verifies inline button click callback starts a block."""
+    monkeypatch.setattr(bot, "AUTHORIZED_USER_ID", 12345)
+    monkeypatch.setattr(bot, "DB_PATH", test_db)
+
+    update = MagicMock()
+    update.message = None
+    update.effective_user.id = 12345
+    update.callback_query.data = "block_15"
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.message.reply_text = AsyncMock()
+    context = MagicMock()
+
+    await bot.handle_callback_query(update, context)
+
+    # User's active timer is set up for 15 minutes
+    assert 12345 in bot.active_timers
+    assert bot.active_timers[12345]["duration_mins"] == 15
+    update.callback_query.answer.assert_called_once()
+
+    # Clean up
+    bot.active_timers.clear()

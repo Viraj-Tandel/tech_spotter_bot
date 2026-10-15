@@ -37,10 +37,17 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
                 date TEXT NOT NULL,
                 block_number INTEGER NOT NULL,
                 duration_mins INTEGER NOT NULL,
+                topic TEXT DEFAULT 'Deep Work',
                 completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
+
+        # Migration: ensure 'topic' column exists for existing databases
+        cursor.execute("PRAGMA table_info(daily_logs)")
+        cols = [r["name"] for r in cursor.fetchall()]
+        if "topic" not in cols:
+            cursor.execute("ALTER TABLE daily_logs ADD COLUMN topic TEXT DEFAULT 'Deep Work'")
 
         # Table 2: Singleton table tracking live streak status
         cursor.execute(
@@ -65,6 +72,18 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
                 lost_streak_count INTEGER NOT NULL,
                 recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 notes TEXT DEFAULT 'Missed daily block'
+            );
+            """
+        )
+
+        # Table 4: Track weekly streak freeze / rest days (max 1 per calendar week)
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS streak_freezes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL,
+                reason TEXT DEFAULT 'Rest day',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
@@ -133,6 +152,7 @@ def get_next_block_number(today_str: str, db_path: str = DEFAULT_DB_PATH) -> int
 def record_completed_block(
     duration_mins: int,
     session_date: Optional[str] = None,
+    topic: str = "Deep Work",
     tz_name: str = DEFAULT_TIMEZONE,
     db_path: str = DEFAULT_DB_PATH,
 ) -> Dict[str, Any]:
@@ -217,13 +237,13 @@ def record_completed_block(
         )
         block_number = cursor.fetchone()[0]
 
-        # Log block
+        # Log block with topic
         cursor.execute(
             """
-            INSERT INTO daily_logs (date, block_number, duration_mins)
-            VALUES (?, ?, ?)
+            INSERT INTO daily_logs (date, block_number, duration_mins, topic)
+            VALUES (?, ?, ?, ?)
             """,
-            (today_str, block_number, duration_mins),
+            (today_str, block_number, duration_mins, topic),
         )
 
         # Update streak_state
@@ -272,6 +292,7 @@ def record_completed_block(
             "streak_broken": streak_broken,
             "lost_streak_count": lost_streak_count,
             "session_date": today_str,
+            "topic": topic,
         }
 
 
@@ -344,6 +365,17 @@ def get_status(
         today_blocks = today_row[0]
         today_mins = today_row[1]
 
+        # Check weekly streak freeze status
+        monday = today_date - timedelta(days=today_date.weekday())
+        sunday = monday + timedelta(days=6)
+        cursor.execute(
+            "SELECT COUNT(*), MAX(date) FROM streak_freezes WHERE date >= ? AND date <= ?",
+            (monday.strftime("%Y-%m-%d"), sunday.strftime("%Y-%m-%d")),
+        )
+        freeze_info = cursor.fetchone()
+        freeze_used_this_week = (freeze_info[0] > 0) if freeze_info else False
+        last_freeze_date = freeze_info[1] if freeze_info else None
+
         return {
             "today_date": today_str,
             "today_blocks": today_blocks,
@@ -355,6 +387,8 @@ def get_status(
             "completed_today": completed_today,
             "is_streak_broken": is_streak_broken,
             "in_grace_period": in_grace_period,
+            "freeze_used_this_week": freeze_used_this_week,
+            "last_freeze_date": last_freeze_date,
             "total_blocks_completed": total_blocks,
             "total_minutes_completed": total_mins,
         }
@@ -365,7 +399,7 @@ def get_history(
     tz_name: str = DEFAULT_TIMEZONE,
     db_path: str = DEFAULT_DB_PATH,
 ) -> List[Dict[str, Any]]:
-    """Fetches completed blocks summary for the last N calendar days."""
+    """Fetches completed blocks summary and topics for the last N calendar days."""
     today_str = get_today_date(tz_name)
     today_date = datetime.strptime(today_str, "%Y-%m-%d").date()
     start_date = (today_date - timedelta(days=days - 1)).strftime("%Y-%m-%d")
@@ -374,7 +408,8 @@ def get_history(
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT date, COUNT(*) as blocks, COALESCE(SUM(duration_mins), 0) as total_mins
+            SELECT date, COUNT(*) as blocks, COALESCE(SUM(duration_mins), 0) as total_mins,
+                   GROUP_CONCAT(DISTINCT topic) as topics
             FROM daily_logs
             WHERE date >= ?
             GROUP BY date
@@ -384,20 +419,173 @@ def get_history(
         )
         rows = cursor.fetchall()
 
-        history_map = {row["date"]: {"blocks": row["blocks"], "total_mins": row["total_mins"]} for row in rows}
+        history_map = {
+            row["date"]: {
+                "blocks": row["blocks"],
+                "total_mins": row["total_mins"],
+                "topics": row["topics"] if row["topics"] else "",
+            }
+            for row in rows
+        }
 
         # Build full sequence of days (including 0-block days)
         result = []
         for i in range(days):
             d_str = (today_date - timedelta(days=i)).strftime("%Y-%m-%d")
-            data = history_map.get(d_str, {"blocks": 0, "total_mins": 0})
+            data = history_map.get(d_str, {"blocks": 0, "total_mins": 0, "topics": ""})
             result.append({
                 "date": d_str,
                 "blocks": data["blocks"],
                 "total_mins": data["total_mins"],
+                "topics": data["topics"],
             })
 
         return result
+
+
+def apply_streak_freeze(
+    reason: str = "Rest day",
+    tz_name: str = DEFAULT_TIMEZONE,
+    db_path: str = DEFAULT_DB_PATH,
+) -> Dict[str, Any]:
+    """
+    Applies a streak freeze / rest day for the current calendar week (Monday to Sunday).
+    Only 1 rest day is permitted per week.
+    Returns success status, message, and freeze details.
+    """
+    tz = pytz.timezone(tz_name)
+    now_dt = datetime.now(tz)
+    today_date = now_dt.date()
+    today_str = today_date.strftime("%Y-%m-%d")
+
+    # Calendar week runs Monday to Sunday
+    monday = today_date - timedelta(days=today_date.weekday())
+    sunday = monday + timedelta(days=6)
+    monday_str = monday.strftime("%Y-%m-%d")
+    sunday_str = sunday.strftime("%Y-%m-%d")
+
+    with get_db_connection(db_path) as conn:
+        cursor = conn.cursor()
+
+        # Check if already used this week
+        cursor.execute(
+            """
+            SELECT date, reason, created_at
+            FROM streak_freezes
+            WHERE date >= ? AND date <= ?
+            """,
+            (monday_str, sunday_str),
+        )
+        existing = cursor.fetchone()
+        if existing:
+            return {
+                "ok": False,
+                "already_used": True,
+                "used_date": existing["date"],
+                "reason": existing["reason"],
+                "message": f"You've already used your 1 Rest Day for this week on {existing['date']}. Rest days reset every Monday!",
+            }
+
+        # Insert freeze
+        cursor.execute(
+            "INSERT INTO streak_freezes (date, reason) VALUES (?, ?)",
+            (today_str, reason),
+        )
+
+        # Update streak_state: protect current streak by updating last_active_date to today_str
+        cursor.execute(
+            """
+            SELECT current_streak, longest_streak, last_active_date
+            FROM streak_state WHERE id = 1
+            """
+        )
+        state = cursor.fetchone()
+        curr_streak = state["current_streak"] if state else 0
+        long_streak = state["longest_streak"] if state else 0
+
+        cursor.execute(
+            """
+            UPDATE streak_state
+            SET last_active_date = ?
+            WHERE id = 1
+            """,
+            (today_str,),
+        )
+        conn.commit()
+
+        return {
+            "ok": True,
+            "already_used": False,
+            "date": today_str,
+            "reason": reason,
+            "current_streak": curr_streak,
+            "message": f"Rest day credited for {today_str}. Streak of {curr_streak} day(s) protected!",
+        }
+
+
+def get_weekly_summary(
+    tz_name: str = DEFAULT_TIMEZONE,
+    db_path: str = DEFAULT_DB_PATH,
+) -> Dict[str, Any]:
+    """
+    Returns weekly deep work summary (Monday through Sunday),
+    including total hours, blocks, topics covered, and consistency rating.
+    """
+    tz = pytz.timezone(tz_name)
+    now_dt = datetime.now(tz)
+    today_date = now_dt.date()
+    monday = today_date - timedelta(days=today_date.weekday())
+    sunday = monday + timedelta(days=6)
+    monday_str = monday.strftime("%Y-%m-%d")
+    sunday_str = sunday.strftime("%Y-%m-%d")
+
+    with get_db_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT date, duration_mins, topic
+            FROM daily_logs
+            WHERE date >= ? AND date <= ?
+            ORDER BY date ASC
+            """,
+            (monday_str, sunday_str),
+        )
+        rows = cursor.fetchall()
+
+        total_mins = sum(r["duration_mins"] for r in rows)
+        total_blocks = len(rows)
+        active_days = len(set(r["date"] for r in rows))
+
+        cursor.execute(
+            "SELECT COUNT(*), MAX(date) FROM streak_freezes WHERE date >= ? AND date <= ?",
+            (monday_str, sunday_str),
+        )
+        freeze_row = cursor.fetchone()
+        freezes_used = freeze_row[0] if freeze_row else 0
+        last_freeze_date = freeze_row[1] if freeze_row else None
+
+        # Collect unique topics
+        raw_topics = [r["topic"] for r in rows if r["topic"]]
+        unique_topics = []
+        for t in raw_topics:
+            if t not in unique_topics:
+                unique_topics.append(t)
+
+        consistency_days = active_days + freezes_used
+        consistency_pct = int((min(7, consistency_days) / 7.0) * 100)
+
+        return {
+            "week_start": monday_str,
+            "week_end": sunday_str,
+            "total_mins": total_mins,
+            "total_hours": round(total_mins / 60.0, 1),
+            "total_blocks": total_blocks,
+            "active_days": active_days,
+            "freezes_used": freezes_used,
+            "last_freeze_date": last_freeze_date,
+            "consistency_pct": consistency_pct,
+            "topics": unique_topics,
+        }
 
 
 def get_breaks(

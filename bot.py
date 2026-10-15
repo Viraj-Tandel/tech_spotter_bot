@@ -12,12 +12,13 @@ from typing import Dict, Any, Optional
 
 import pytz
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     ApplicationBuilder,
     CommandHandler,
+    CallbackQueryHandler,
     ContextTypes,
 )
 
@@ -52,8 +53,41 @@ except Exception:
     TIMEZONE = pytz.timezone("Asia/Kolkata")
 
 # In-memory dictionary tracking active focus timers per user
-# user_id -> {"job": Job, "block_number": int, "duration_mins": int, "start_time": datetime, "end_time": datetime, "session_type": str}
+# user_id -> {"job": Job, "block_number": int, "duration_mins": int, "start_time": datetime, "end_time": datetime, "session_type": str, "session_date": str, "topic": str}
 active_timers: Dict[int, Dict[str, Any]] = {}
+
+
+def get_main_keyboard() -> InlineKeyboardMarkup:
+    """Returns quick action buttons for one-tap mobile control."""
+    keyboard = [
+        [
+            InlineKeyboardButton("⏱️ 15m", callback_data="block_15"),
+            InlineKeyboardButton("⏱️ 30m", callback_data="block_30"),
+            InlineKeyboardButton("⏱️ 45m", callback_data="block_45"),
+            InlineKeyboardButton("⏱️ 60m", callback_data="block_60"),
+        ],
+        [
+            InlineKeyboardButton("🛡️ Block 2 (Code)", callback_data="block_b2"),
+            InlineKeyboardButton("🛑 Stop", callback_data="action_stop"),
+        ],
+        [
+            InlineKeyboardButton("📊 Status", callback_data="action_status"),
+            InlineKeyboardButton("📅 History", callback_data="action_history"),
+            InlineKeyboardButton("📈 Weekly", callback_data="action_weekly"),
+        ],
+        [
+            InlineKeyboardButton("🧊 Rest Day / Freeze", callback_data="action_freeze"),
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def reply(update: Update, text: str, **kwargs):
+    """Safely replies to either a Message or a CallbackQuery."""
+    if update.message:
+        return await update.message.reply_text(text, **kwargs)
+    elif update.callback_query and update.callback_query.message:
+        return await update.callback_query.message.reply_text(text, **kwargs)
 
 
 def restricted(func):
@@ -90,6 +124,7 @@ async def block_timer_completed_callback(context: ContextTypes.DEFAULT_TYPE):
     chat_id = job_data["chat_id"]
     duration_mins = job_data["duration_mins"]
     session_type = job_data.get("session_type", "general")
+    topic = job_data.get("topic", "Deep Work")
 
     # Remove from active timers
     if user_id in active_timers:
@@ -100,6 +135,7 @@ async def block_timer_completed_callback(context: ContextTypes.DEFAULT_TYPE):
     result = database.record_completed_block(
         duration_mins=duration_mins,
         session_date=session_date,
+        topic=topic,
         tz_name=TIMEZONE_NAME,
         db_path=DB_PATH,
     )
@@ -134,7 +170,7 @@ async def block_timer_completed_callback(context: ContextTypes.DEFAULT_TYPE):
 
     msg = (
         f"🔔 <b>Ding! {duration_mins} minutes up!</b>\n\n"
-        f"✅ <b>Block {block_num} completed.</b>\n"
+        f"✅ <b>Block {block_num} completed ({topic}).</b>\n"
         f"📊 <b>Today's Total:</b> {today_blocks} block(s) ({today_mins} mins deep work)\n"
         f"🏆 <b>Streak:</b> {streak_badge}{streak_note}{closing_note}"
     )
@@ -143,6 +179,7 @@ async def block_timer_completed_callback(context: ContextTypes.DEFAULT_TYPE):
         chat_id=chat_id,
         text=msg,
         parse_mode=ParseMode.HTML,
+        reply_markup=get_main_keyboard(),
     )
 
 
@@ -151,6 +188,7 @@ async def start_focus_block(
     context: ContextTypes.DEFAULT_TYPE,
     duration_mins: int,
     session_type: str = "general",
+    topic: str = "Deep Work",
 ):
     """Core routine to schedule and lock in a focus block."""
     user = update.effective_user
@@ -164,11 +202,13 @@ async def start_focus_block(
         now_cmp = datetime.now(TIMEZONE) if end_time_val.tzinfo else datetime.now()
         remaining = (end_time_val - now_cmp).total_seconds()
         rem_str = format_remaining_time(remaining)
-        await update.message.reply_text(
+        await reply(
+            update,
             f"⚠️ <b>Active block already in progress!</b>\n"
-            f"Block {current_timer['block_number']} has <b>{rem_str}</b> remaining.\n\n"
+            f"Block {current_timer['block_number']} ({current_timer.get('topic', 'Deep Work')}) has <b>{rem_str}</b> remaining.\n\n"
             f"Use /stop to cancel the active timer if you need to abort.",
             parse_mode=ParseMode.HTML,
+            reply_markup=get_main_keyboard(),
         )
         return
 
@@ -189,6 +229,7 @@ async def start_focus_block(
             "block_number": next_block_num,
             "session_type": session_type,
             "session_date": session_date,
+            "topic": topic,
         },
         name=f"timer_{user.id}_{int(now.timestamp())}",
     )
@@ -201,6 +242,7 @@ async def start_focus_block(
         "end_time": end_time,
         "session_type": session_type,
         "session_date": session_date,
+        "topic": topic,
     }
 
     # Construct lock-in message
@@ -229,11 +271,12 @@ async def start_focus_block(
 
     msg = (
         f"👀 <b>Spotter locked in for {title_desc}.</b>\n\n"
+        f"🎯 <b>Topic:</b> {topic}\n"
         f"⏱️ <b>Timer:</b> {duration_mins} minutes\n"
         f"📱 <b>Protocol:</b> Phone face-down. I'm watching the clock. Lock in.{shield_text}"
     )
 
-    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+    await reply(update, msg, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
 
 
 # ---------------------------------------------------------
@@ -242,70 +285,88 @@ async def start_focus_block(
 
 @restricted
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Sends welcome message and bot commands menu."""
+    """Sends welcome message and bot commands menu with one-tap action buttons."""
     msg = (
         "🏋️‍♂️ <b>Welcome to Tech Spotter!</b>\n\n"
         "I am your digital body double and consistency engine for mastering DSA and side projects.\n\n"
         "<b>Core Routine Commands:</b>\n"
-        "• <code>/block1</code> - 30 min Theory (Home Desk - Namaste DSA)\n"
-        "• <code>/block2</code> - 30 min Code + 🛡️ Slack Shield (Office Desk)\n"
-        "• <code>/block [mins]</code> - Custom focus block (default: 30 mins)\n"
+        "• <code>/block [mins] [topic]</code> - Focus block (e.g. <code>/block 15 Trees</code>)\n"
+        "• <code>/block1 [topic]</code> - 30m Theory (Home Desk - Namaste DSA)\n"
+        "• <code>/block2 [topic]</code> - 30m Code + 🛡️ Slack Shield (Office Desk)\n"
         "• <code>/stop</code> - Cancel current active timer (discards block)\n\n"
-        "<b>Tracking & Insights:</b>\n"
+        "<b>Consistency & Recovery:</b>\n"
         "• <code>/status</code> - Live timer, today's blocks & streak status\n"
-        "• <code>/history</code> - Past 7 days breakdown\n"
-        "• <code>/breaks</code> - Streak break audit trail\n"
+        "• <code>/history</code> - Past 7 days breakdown with topics\n"
+        "• <code>/weekly</code> - Full weekly summary & consistency score\n"
+        "• <code>/freeze [reason]</code> - Use your 1 weekly rest day without losing streak\n"
         "• <code>/health</code> - Diagnostic connection & DB test\n\n"
-        "<i>Consistency beats motivation. Let's rack up the reps.</i>"
+        "<i>Tap a quick button below to lock in immediately:</i>"
     )
-    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+    await reply(update, msg, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
 
 
 @restricted
 async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Starts a focus block. Accepts optional minutes argument (e.g., /block 45)."""
+    """Starts a focus block. Accepts optional minutes and topic (e.g., /block 15 Trees, /block 45)."""
     duration = 30
+    topic = "Deep Work"
+
     if context.args:
+        first_arg = context.args[0]
         try:
-            val = int(context.args[0])
+            val = int(first_arg)
             if 1 <= val <= 240:
                 duration = val
+                if len(context.args) > 1:
+                    topic = " ".join(context.args[1:])
             else:
-                await update.message.reply_text("⚠️ Duration must be between 1 and 240 minutes.")
+                await reply(update, "⚠️ Duration must be between 1 and 240 minutes.")
                 return
         except ValueError:
-            await update.message.reply_text("⚠️ Invalid duration. Usage: <code>/block [minutes]</code>", parse_mode=ParseMode.HTML)
-            return
+            # First arg was a topic name rather than a number (e.g. /block Trees)
+            topic = " ".join(context.args)
 
-    await start_focus_block(update, context, duration_mins=duration, session_type="general")
+    await start_focus_block(update, context, duration_mins=duration, session_type="general", topic=topic)
 
 
 @restricted
 async def cmd_block1(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Starts Block 1: 30 minutes Theory (Namaste DSA)."""
+    """Starts Block 1: 30 minutes Theory (Namaste DSA). Accepts optional topic."""
     duration = 30
+    topic = "Namaste DSA (Theory)"
     if context.args:
         try:
             val = int(context.args[0])
             if 1 <= val <= 240:
                 duration = val
+                if len(context.args) > 1:
+                    topic = f"Namaste DSA: {' '.join(context.args[1:])}"
+            else:
+                topic = f"Namaste DSA: {' '.join(context.args)}"
         except ValueError:
-            pass
-    await start_focus_block(update, context, duration_mins=duration, session_type="block1")
+            topic = f"Namaste DSA: {' '.join(context.args)}"
+
+    await start_focus_block(update, context, duration_mins=duration, session_type="block1", topic=topic)
 
 
 @restricted
 async def cmd_block2(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Starts Block 2: 30 minutes Code with Slack Shield enforcement."""
+    """Starts Block 2: 30 minutes Code with Slack Shield enforcement. Accepts optional topic."""
     duration = 30
+    topic = "Namaste DSA (Code)"
     if context.args:
         try:
             val = int(context.args[0])
             if 1 <= val <= 240:
                 duration = val
+                if len(context.args) > 1:
+                    topic = f"Namaste DSA: {' '.join(context.args[1:])}"
+            else:
+                topic = f"Namaste DSA: {' '.join(context.args)}"
         except ValueError:
-            pass
-    await start_focus_block(update, context, duration_mins=duration, session_type="block2")
+            topic = f"Namaste DSA: {' '.join(context.args)}"
+
+    await start_focus_block(update, context, duration_mins=duration, session_type="block2", topic=topic)
 
 
 @restricted
@@ -313,7 +374,7 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancels an ongoing block timer prematurely. Discards the block per protocol."""
     user = update.effective_user
     if user.id not in active_timers:
-        await update.message.reply_text("💤 No active block timer is running.")
+        await reply(update, "💤 No active block timer is running.", reply_markup=get_main_keyboard())
         return
 
     timer_info = active_timers.pop(user.id)
@@ -322,16 +383,19 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         job.schedule_removal()
 
     block_num = timer_info["block_number"]
-    await update.message.reply_text(
-        f"🛑 <b>Block {block_num} cancelled.</b>\n"
+    topic = timer_info.get("topic", "Deep Work")
+    await reply(
+        update,
+        f"🛑 <b>Block {block_num} ({topic}) cancelled.</b>\n"
         f"Timer stopped. No minutes logged. Rest and reset for the next rep.",
         parse_mode=ParseMode.HTML,
+        reply_markup=get_main_keyboard(),
     )
 
 
 @restricted
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Shows live status: active countdown (if any), today's totals, streak."""
+    """Shows live status: active countdown (if any), today's totals, streak, and rest days."""
     user = update.effective_user
     status = database.get_status(tz_name=TIMEZONE_NAME, db_path=DB_PATH)
 
@@ -344,7 +408,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         now_cmp = datetime.now(TIMEZONE) if end_time_val.tzinfo else datetime.now()
         rem = (end_time_val - now_cmp).total_seconds()
         rem_str = format_remaining_time(rem)
-        timer_text = f"⏱️ <b>Active:</b> Block {current['block_number']} ({rem_str} remaining)"
+        timer_text = (
+            f"⏱️ <b>Active:</b> Block {current['block_number']} ({current.get('topic', 'Deep Work')})\n"
+            f"   ⏳ <b>Remaining:</b> {rem_str}"
+        )
     else:
         timer_text = "💤 <b>Active:</b> No timer running"
 
@@ -375,22 +442,28 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             streak_status = "⏳ Pending today"
         streak_display = f"Day {current_streak} 🔥 ({streak_status})"
 
+    freeze_note = ""
+    if status.get("freeze_used_this_week"):
+        freeze_note = f"\n🧊 <b>Weekly Rest Day:</b> Used on {status.get('last_freeze_date')}"
+    else:
+        freeze_note = "\n🧊 <b>Weekly Rest Day:</b> 1 available (/freeze)"
+
     msg = (
         f"📊 <b>Tech Spotter Live Status</b>\n"
         f"🗓️ <b>Date:</b> {status['today_date']}\n\n"
         f"{timer_text}\n\n"
         f"📦 <b>Today:</b> {today_blocks} completed ({today_mins} mins)\n"
         f"🔥 <b>Current Streak:</b> {streak_display}\n"
-        f"🏆 <b>Best Streak:</b> {longest_streak} days\n"
+        f"🏆 <b>Best Streak:</b> {longest_streak} days{freeze_note}\n"
         f"📈 <b>Lifetime:</b> {status['total_blocks_completed']} blocks | {status['total_minutes_completed']} mins"
     )
 
-    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+    await reply(update, msg, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
 
 
 @restricted
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Shows history of completed blocks over the last 7 days."""
+    """Shows history of completed blocks and topics over the last 7 days."""
     history = database.get_history(days=7, tz_name=TIMEZONE_NAME, db_path=DB_PATH)
 
     lines = []
@@ -404,7 +477,8 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_week_mins += mins
 
         badge = "🔥" if blocks > 0 else "⚪"
-        lines.append(f"{badge} <code>{day['date']}</code>: {blocks} block(s) ({mins} mins)")
+        topic_suffix = f" — <i>{day['topics']}</i>" if day.get("topics") else ""
+        lines.append(f"{badge} <code>{day['date']}</code>: {blocks} block(s) ({mins} mins){topic_suffix}")
 
     msg = (
         "📅 <b>Past 7 Days History</b>\n\n"
@@ -412,7 +486,62 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + f"\n\n<b>Weekly Total:</b> {total_week_blocks} blocks | {total_week_mins} mins deep work"
     )
 
-    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+    await reply(update, msg, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
+
+
+@restricted
+async def cmd_freeze(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Applies a weekly streak freeze / rest day to protect streak."""
+    reason = "Rest Day"
+    if context.args:
+        reason = " ".join(context.args)
+
+    result = database.apply_streak_freeze(reason=reason, tz_name=TIMEZONE_NAME, db_path=DB_PATH)
+    if result["ok"]:
+        msg = (
+            f"🧊 <b>Streak Freeze Activated!</b>\n\n"
+            f"🗓️ <b>Date:</b> {result['date']}\n"
+            f"🛡️ <b>Status:</b> Streak of {result['current_streak']} day(s) is protected!\n"
+            f"📝 <b>Reason:</b> {result['reason']}\n\n"
+            f"<i>Rest and recovery are just as essential as training. Enjoy your rest day!</i>"
+        )
+    else:
+        msg = f"⚠️ <b>Rest Day Already Used</b>\n\n{result['message']}"
+
+    await reply(update, msg, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
+
+
+@restricted
+async def cmd_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Shows current week's deep work summary, topics, and consistency score."""
+    summary = database.get_weekly_summary(tz_name=TIMEZONE_NAME, db_path=DB_PATH)
+
+    topics_str = ", ".join(summary["topics"]) if summary["topics"] else "Deep Work"
+    freeze_note = ""
+    if summary["freezes_used"] > 0:
+        freeze_note = f"\n🧊 <b>Rest Days Used:</b> {summary['freezes_used']}/1 (Protected on {summary['last_freeze_date']})"
+    else:
+        freeze_note = "\n🧊 <b>Rest Days:</b> 1 available this week (/freeze)"
+
+    score = summary["consistency_pct"]
+    if score >= 85:
+        tier = "🏆 Elite Tier (Unstoppable)"
+    elif score >= 60:
+        tier = "🔥 Solid Consistency"
+    else:
+        tier = "⚡ In Progress (Keep showing up)"
+
+    msg = (
+        f"📈 <b>Weekly Consistency Recap</b>\n"
+        f"🗓️ <b>Week:</b> <code>{summary['week_start']}</code> to <code>{summary['week_end']}</code>\n\n"
+        f"⏱️ <b>Total Deep Work:</b> {summary['total_hours']} hrs ({summary['total_mins']} mins)\n"
+        f"📦 <b>Completed Blocks:</b> {summary['total_blocks']} block(s)\n"
+        f"🎯 <b>Topics Covered:</b> {topics_str}\n"
+        f"🔥 <b>Active Days:</b> {summary['active_days']} / 7 days\n"
+        f"📊 <b>Consistency Score:</b> {score}% — {tier}{freeze_note}\n\n"
+        f"<i>Small daily reps compound into mastery. Let's conquer the upcoming week!</i>"
+    )
+    await reply(update, msg, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
 
 
 @restricted
@@ -422,7 +551,7 @@ async def cmd_breaks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not breaks:
         msg = "✨ <b>Streak Break Audit Log</b>\n\nNo broken streaks recorded yet! Keep the chain unbroken."
-        await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+        await reply(update, msg, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
         return
 
     lines = []
@@ -432,7 +561,7 @@ async def cmd_breaks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     msg = "📉 <b>Streak Break Audit Log</b>\n\n" + "\n".join(lines)
-    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+    await reply(update, msg, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
 
 
 @restricted
@@ -465,50 +594,46 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔒 <b>Authorized User:</b> <code>{AUTHORIZED_USER_ID}</code>"
     )
 
-    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+    await reply(update, msg, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
+
+
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles interactive inline button clicks."""
+    query = update.callback_query
+    await query.answer()
+
+    user = update.effective_user
+    if not user or AUTHORIZED_USER_ID is None or user.id != AUTHORIZED_USER_ID:
+        return
+
+    data = query.data
+    if data == "block_15":
+        await start_focus_block(update, context, duration_mins=15, session_type="general", topic="Deep Work")
+    elif data == "block_30":
+        await start_focus_block(update, context, duration_mins=30, session_type="general", topic="Deep Work")
+    elif data == "block_45":
+        await start_focus_block(update, context, duration_mins=45, session_type="general", topic="Deep Work")
+    elif data == "block_60":
+        await start_focus_block(update, context, duration_mins=60, session_type="general", topic="Bonus Rep")
+    elif data == "block_b1":
+        await start_focus_block(update, context, duration_mins=30, session_type="block1", topic="Namaste DSA (Theory)")
+    elif data == "block_b2":
+        await start_focus_block(update, context, duration_mins=30, session_type="block2", topic="Namaste DSA (Code)")
+    elif data == "action_status":
+        await cmd_status(update, context)
+    elif data == "action_history":
+        await cmd_history(update, context)
+    elif data == "action_weekly":
+        await cmd_weekly(update, context)
+    elif data == "action_stop":
+        await cmd_stop(update, context)
+    elif data == "action_freeze":
+        await cmd_freeze(update, context)
 
 
 # ---------------------------------------------------------
-# Automated Scheduled Nudges
+# Automated Scheduled Jobs
 # ---------------------------------------------------------
-
-async def scheduled_morning_block1(context: ContextTypes.DEFAULT_TYPE):
-    """09:45 AM daily nudge for Block 1 (Theory / Namaste DSA)."""
-    if AUTHORIZED_USER_ID:
-        msg = (
-            "⏰ <b>09:45 AM: Morning Study Window Open!</b>\n\n"
-            "Post-gym protein shake and shower done? Your brain is primed with endorphins.\n"
-            "Ready for <b>Block 1 (Namaste DSA Video / Theory)</b>?\n\n"
-            "Send <code>/block1</code> to lock in."
-        )
-        try:
-            await context.bot.send_message(
-                chat_id=AUTHORIZED_USER_ID,
-                text=msg,
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception as e:
-            logger.error("Failed to send morning Block 1 nudge: %s", e)
-
-
-async def scheduled_morning_block2(context: ContextTypes.DEFAULT_TYPE):
-    """10:30 AM daily nudge for Block 2 (Code / Slack Shield)."""
-    if AUTHORIZED_USER_ID:
-        msg = (
-            "⏰ <b>10:30 AM: Office Desk Arrival!</b>\n\n"
-            "Grab your coffee. Keep Slack and Outlook closed.\n"
-            "Ready for <b>Block 2 (Hands-on Code / Assignment)</b>?\n\n"
-            "Send <code>/block2</code> to lock in with 🛡️ <b>Slack Shield</b>."
-        )
-        try:
-            await context.bot.send_message(
-                chat_id=AUTHORIZED_USER_ID,
-                text=msg,
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception as e:
-            logger.error("Failed to send morning Block 2 nudge: %s", e)
-
 
 async def scheduled_sleep_reminder(context: ContextTypes.DEFAULT_TYPE):
     """10:00 PM daily gentle sleep reminder for 7-hour rest before 06:00 AM gym."""
@@ -523,13 +648,39 @@ async def scheduled_sleep_reminder(context: ContextTypes.DEFAULT_TYPE):
                 chat_id=AUTHORIZED_USER_ID,
                 text=msg,
                 parse_mode=ParseMode.HTML,
+                reply_markup=get_main_keyboard(),
             )
         except Exception as e:
             logger.error("Failed to send sleep reminder: %s", e)
 
 
+async def scheduled_sunday_digest(context: ContextTypes.DEFAULT_TYPE):
+    """Sunday 08:00 PM weekly summary digest."""
+    if AUTHORIZED_USER_ID:
+        summary = database.get_weekly_summary(tz_name=TIMEZONE_NAME, db_path=DB_PATH)
+        topics_str = ", ".join(summary["topics"]) if summary["topics"] else "Deep Work"
+        score = summary["consistency_pct"]
+        msg = (
+            f"📈 <b>Sunday Night Weekly Digest</b>\n\n"
+            f"Here is your consistency report for this week:\n"
+            f"• <b>Total Deep Work:</b> {summary['total_hours']} hours ({summary['total_blocks']} blocks)\n"
+            f"• <b>Active Consistency:</b> {summary['active_days']}/7 days ({score}%)\n"
+            f"• <b>Topics Covered:</b> {topics_str}\n\n"
+            f"Rest well tonight. Get ready to attack your Namaste DSA reps tomorrow! 🚀"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=AUTHORIZED_USER_ID,
+                text=msg,
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_main_keyboard(),
+            )
+        except Exception as e:
+            logger.error("Failed to send Sunday digest: %s", e)
+
+
 def setup_scheduled_jobs(application: Application):
-    """Configures daily scheduled notifications in JobQueue."""
+    """Configures daily and weekly scheduled notifications in JobQueue."""
     job_queue = application.job_queue
     if not job_queue:
         logger.warning("JobQueue is not enabled in this Application instance.")
@@ -541,7 +692,15 @@ def setup_scheduled_jobs(application: Application):
         time=time(hour=22, minute=0, tzinfo=TIMEZONE),
         name="daily_nudge_2200",
     )
-    logger.info("Daily sleep reminder configured for 22:00 %s", TIMEZONE_NAME)
+
+    # Sunday 08:00 PM IST (20:00) - Weekly Digest
+    job_queue.run_daily(
+        scheduled_sunday_digest,
+        time=time(hour=20, minute=0, tzinfo=TIMEZONE),
+        days=(6,),  # 6 = Sunday in PTB
+        name="weekly_sunday_digest",
+    )
+    logger.info("Daily sleep reminder (22:00) and Sunday digest (20:00) configured for %s", TIMEZONE_NAME)
 
 
 def build_application() -> Application:
@@ -558,6 +717,7 @@ def build_application() -> Application:
 
     # Register command handlers
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("block", cmd_block))
     app.add_handler(CommandHandler("block1", cmd_block1))
     app.add_handler(CommandHandler("block2", cmd_block2))
@@ -567,8 +727,15 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("breaks", cmd_breaks))
     app.add_handler(CommandHandler("health", cmd_health))
     app.add_handler(CommandHandler("ping", cmd_health))
+    app.add_handler(CommandHandler("freeze", cmd_freeze))
+    app.add_handler(CommandHandler("rest", cmd_freeze))
+    app.add_handler(CommandHandler("weekly", cmd_weekly))
+    app.add_handler(CommandHandler("summary", cmd_weekly))
 
-    # Setup daily scheduled jobs
+    # Register CallbackQueryHandler for interactive buttons
+    app.add_handler(CallbackQueryHandler(handle_callback_query))
+
+    # Setup daily & weekly scheduled jobs
     setup_scheduled_jobs(app)
 
     return app
