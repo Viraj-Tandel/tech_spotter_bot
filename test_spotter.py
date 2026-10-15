@@ -310,3 +310,66 @@ async def test_active_timer_guard(monkeypatch, test_db):
 
     # Clean up
     bot.active_timers.clear()
+
+
+def test_15_minute_block_increments_streak(test_db):
+    """Verifies that studying for 15 minutes counts and increments the streak."""
+    result = database.record_completed_block(15, db_path=test_db)
+    assert result["duration_mins"] == 15
+    assert result["today_blocks"] == 1
+    assert result["today_minutes"] == 15
+    assert result["current_streak"] == 1
+    assert result["streak_broken"] is False
+
+
+def test_midnight_crossing_preserves_streak(test_db):
+    """
+    User scenario:
+    User starts timer at 11:45 PM on Day 1 (yesterday).
+    Timer completes after midnight (Day 2).
+    Because session_date = yesterday was passed, it credits Day 1!
+    Streak increments to 2 on Day 2 when next block is done!
+    """
+    tz = pytz.timezone("Asia/Kolkata")
+    today = datetime.now(tz).date()
+    yesterday_str = (today - timedelta(days=1)).strftime("%Y-%m-%d")
+    two_days_ago_str = (today - timedelta(days=2)).strftime("%Y-%m-%d")
+
+    # Set Day 0 active
+    with database.get_db_connection(test_db) as conn:
+        conn.execute(
+            """
+            UPDATE streak_state
+            SET current_streak = 5, longest_streak = 5, last_active_date = ?,
+                total_blocks_completed = 5, total_minutes_completed = 150
+            WHERE id = 1
+            """,
+            (two_days_ago_str,),
+        )
+        conn.commit()
+
+    # User started block at 11:45 PM on yesterday (Day 1) and finished at 12:15 AM today
+    res = database.record_completed_block(30, session_date=yesterday_str, db_path=test_db)
+    assert res["session_date"] == yesterday_str
+    assert res["current_streak"] == 6  # Incremented from 5 to 6!
+    assert res["streak_broken"] is False  # NOT broken!
+
+    # Then today user studies again
+    res2 = database.record_completed_block(15, session_date=today.strftime("%Y-%m-%d"), db_path=test_db)
+    assert res2["current_streak"] == 7  # Incremented to 7!
+    assert res2["streak_broken"] is False
+
+
+def test_night_owl_grace_period_attributes_to_yesterday(test_db):
+    """
+    If user starts a session at 1:30 AM (between 00:00 and 04:00 AM)
+    and yesterday has 0 blocks, get_logical_date attributes it to yesterday.
+    """
+    tz = pytz.timezone("Asia/Kolkata")
+    today_dt = datetime.now(tz)
+    # Simulate 01:30 AM
+    night_dt = today_dt.replace(hour=1, minute=30, second=0)
+    yesterday_str = (today_dt.date() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    logical = database.get_logical_date(dt=night_dt, tz_name="Asia/Kolkata", db_path=test_db)
+    assert logical == yesterday_str

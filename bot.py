@@ -96,8 +96,10 @@ async def block_timer_completed_callback(context: ContextTypes.DEFAULT_TYPE):
         del active_timers[user_id]
 
     # Record block in database
+    session_date = job_data.get("session_date")
     result = database.record_completed_block(
         duration_mins=duration_mins,
+        session_date=session_date,
         tz_name=TIMEZONE_NAME,
         db_path=DB_PATH,
     )
@@ -170,9 +172,9 @@ async def start_focus_block(
         )
         return
 
-    # Determine next block number for today
-    today_str = database.get_today_date(TIMEZONE_NAME)
-    next_block_num = database.get_next_block_number(today_str, db_path=DB_PATH)
+    # Determine logical session date (supports late-night sessions and protects start date)
+    session_date = database.get_logical_date(dt=now, tz_name=TIMEZONE_NAME, db_path=DB_PATH)
+    next_block_num = database.get_next_block_number(session_date, db_path=DB_PATH)
 
     end_time = now + timedelta(minutes=duration_mins)
 
@@ -186,6 +188,7 @@ async def start_focus_block(
             "duration_mins": duration_mins,
             "block_number": next_block_num,
             "session_type": session_type,
+            "session_date": session_date,
         },
         name=f"timer_{user.id}_{int(now.timestamp())}",
     )
@@ -197,6 +200,7 @@ async def start_focus_block(
         "start_time": now,
         "end_time": end_time,
         "session_type": session_type,
+        "session_date": session_date,
     }
 
     # Construct lock-in message
@@ -350,13 +354,25 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     longest_streak = status["longest_streak"]
     is_broken = status["is_streak_broken"]
     completed_today = status["completed_today"]
+    in_grace = status.get("in_grace_period", False)
+    has_active_timer = (user.id in active_timers)
 
     if is_broken:
         streak_display = "0 🔥 (Broken - Missed yesterday, start a new streak today!)"
+    elif in_grace:
+        streak_display = f"Day {current_streak} 🔥 (🌙 Late-night grace window until 04:00 AM)"
     elif current_streak == 0:
-        streak_display = "0 (Complete a block today to ignite your streak!)"
+        if has_active_timer:
+            streak_display = "Igniting today! 🔥 (Active block in progress)"
+        else:
+            streak_display = "0 (Complete a block today to ignite your streak!)"
     else:
-        streak_status = "✅ Completed today" if completed_today else "⏳ Pending today"
+        if completed_today:
+            streak_status = "✅ Completed today"
+        elif has_active_timer:
+            streak_status = "⏳ Active block in progress"
+        else:
+            streak_status = "⏳ Pending today"
         streak_display = f"Day {current_streak} 🔥 ({streak_status})"
 
     msg = (
@@ -519,27 +535,13 @@ def setup_scheduled_jobs(application: Application):
         logger.warning("JobQueue is not enabled in this Application instance.")
         return
 
-    # 09:45 AM IST
-    job_queue.run_daily(
-        scheduled_morning_block1,
-        time=time(hour=9, minute=45, tzinfo=TIMEZONE),
-        name="daily_nudge_0945",
-    )
-
-    # 10:30 AM IST
-    job_queue.run_daily(
-        scheduled_morning_block2,
-        time=time(hour=10, minute=30, tzinfo=TIMEZONE),
-        name="daily_nudge_1030",
-    )
-
-    # 10:00 PM IST (22:00)
+    # 10:00 PM IST (22:00) - Sleep reminder
     job_queue.run_daily(
         scheduled_sleep_reminder,
         time=time(hour=22, minute=0, tzinfo=TIMEZONE),
         name="daily_nudge_2200",
     )
-    logger.info("Daily scheduled nudges configured for 09:45, 10:30, and 22:00 %s", TIMEZONE_NAME)
+    logger.info("Daily sleep reminder configured for 22:00 %s", TIMEZONE_NAME)
 
 
 def build_application() -> Application:

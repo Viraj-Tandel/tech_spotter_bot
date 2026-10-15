@@ -87,6 +87,37 @@ def get_today_date(tz_name: str = DEFAULT_TIMEZONE) -> str:
     return datetime.now(tz).strftime("%Y-%m-%d")
 
 
+def get_logical_date(
+    dt: Optional[datetime] = None,
+    tz_name: str = DEFAULT_TIMEZONE,
+    db_path: str = DEFAULT_DB_PATH,
+) -> str:
+    """
+    Returns the logical date for habit tracking.
+    If a session is initiated between 00:00 and 04:00 AM,
+    and yesterday has no recorded blocks, it attributes to yesterday (late-night grace period).
+    Otherwise, returns the calendar date in target timezone.
+    """
+    tz = pytz.timezone(tz_name)
+    now_dt = dt or datetime.now(tz)
+    calendar_date_str = now_dt.strftime("%Y-%m-%d")
+    current_date = now_dt.date()
+
+    if 0 <= now_dt.hour < 4:
+        yesterday_str = (current_date - timedelta(days=1)).strftime("%Y-%m-%d")
+        with get_db_connection(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT COUNT(*) FROM daily_logs WHERE date = ?",
+                (yesterday_str,),
+            )
+            count = cursor.fetchone()[0]
+            if count == 0:
+                return yesterday_str
+
+    return calendar_date_str
+
+
 def get_next_block_number(today_str: str, db_path: str = DEFAULT_DB_PATH) -> int:
     """Returns the next block number (1, 2, 3...) for the specified date."""
     with get_db_connection(db_path) as conn:
@@ -101,15 +132,21 @@ def get_next_block_number(today_str: str, db_path: str = DEFAULT_DB_PATH) -> int
 
 def record_completed_block(
     duration_mins: int,
+    session_date: Optional[str] = None,
     tz_name: str = DEFAULT_TIMEZONE,
     db_path: str = DEFAULT_DB_PATH,
 ) -> Dict[str, Any]:
     """
     Records a completed focus block and evaluates streak preservation or break.
-    Per user requirement, completing a single block on a consecutive day is sufficient
-    to increment and preserve the streak.
+    If session_date is provided (e.g. from when block was initiated), it uses that date
+    to prevent midnight rollovers from breaking late-night study sessions.
+    Completing a single block (e.g. 15 or 30 mins) is sufficient to increment/preserve streak.
     """
-    today_str = get_today_date(tz_name)
+    if session_date:
+        today_str = session_date
+    else:
+        today_str = get_logical_date(tz_name=tz_name, db_path=db_path)
+
     today_date = datetime.strptime(today_str, "%Y-%m-%d").date()
 
     with get_db_connection(db_path) as conn:
@@ -149,6 +186,10 @@ def record_completed_block(
                 # Consecutive day: increment streak
                 new_curr_streak = curr_streak + 1
                 new_long_streak = max(long_streak, new_curr_streak)
+            elif delta_days < 0:
+                # Completed for an earlier date (e.g. night-owl backfill)
+                new_curr_streak = max(curr_streak, 1)
+                new_long_streak = max(long_streak, new_curr_streak)
             else:
                 # Streak broken (delta_days > 1)
                 streak_broken = True
@@ -186,6 +227,11 @@ def record_completed_block(
         )
 
         # Update streak_state
+        # Only advance last_active_date if today_str is newer than last_active
+        effective_last_active = today_str
+        if last_active and last_date > today_date:
+            effective_last_active = last_active
+
         cursor.execute(
             """
             UPDATE streak_state
@@ -199,7 +245,7 @@ def record_completed_block(
             (
                 new_curr_streak,
                 new_long_streak,
-                today_str,
+                effective_last_active,
                 total_blocks + 1,
                 total_mins + duration_mins,
             ),
@@ -225,6 +271,7 @@ def record_completed_block(
             "longest_streak": new_long_streak,
             "streak_broken": streak_broken,
             "lost_streak_count": lost_streak_count,
+            "session_date": today_str,
         }
 
 
@@ -234,10 +281,14 @@ def get_status(
 ) -> Dict[str, Any]:
     """
     Returns live status metrics. Dynamically calculates if a streak has broken:
-    If last_active_date is >= 2 days ago, effective current streak is 0.
+    If last_active_date is >= 2 days ago, effective current streak is 0,
+    unless within the night-owl grace window (00:00 - 04:00 AM).
     """
-    today_str = get_today_date(tz_name)
-    today_date = datetime.strptime(today_str, "%Y-%m-%d").date()
+    tz = pytz.timezone(tz_name)
+    now_dt = datetime.now(tz)
+    today_str = now_dt.strftime("%Y-%m-%d")
+    today_date = now_dt.date()
+    is_night_owl = (0 <= now_dt.hour < 4)
 
     with get_db_connection(db_path) as conn:
         cursor = conn.cursor()
@@ -260,6 +311,7 @@ def get_status(
         effective_streak = 0
         is_streak_broken = False
         completed_today = False
+        in_grace_period = False
 
         if last_active is not None:
             last_date = datetime.strptime(last_active, "%Y-%m-%d").date()
@@ -272,6 +324,11 @@ def get_status(
                 # Active yesterday, pending today
                 effective_streak = curr_streak
                 completed_today = False
+            elif delta_days == 2 and is_night_owl:
+                # Late-night grace window (00:00 - 04:00 AM)
+                effective_streak = curr_streak
+                completed_today = False
+                in_grace_period = True
             else:
                 # Missed 1+ days -> streak is broken, shows 0
                 effective_streak = 0
@@ -297,6 +354,7 @@ def get_status(
             "last_active_date": last_active,
             "completed_today": completed_today,
             "is_streak_broken": is_streak_broken,
+            "in_grace_period": in_grace_period,
             "total_blocks_completed": total_blocks,
             "total_minutes_completed": total_mins,
         }
